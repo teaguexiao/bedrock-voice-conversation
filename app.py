@@ -6,6 +6,7 @@ import pyaudio
 import sys
 import boto3
 import sounddevice
+import copy
 
 from concurrent.futures import ThreadPoolExecutor
 from amazon_transcribe.client import TranscribeStreamingClient
@@ -23,7 +24,7 @@ if model_id not in get_model_ids():
 
 api_request = api_request_list[model_id]
 config = {
-    'log_level': 'none',  # One of: info, debug, none
+    'log_level': 'debug',  # One of: info, debug, none
     'last_speech': "If you have any other questions, please don't hesitate to ask. Have a great day!",
     'region': aws_region,
     'polly': {
@@ -37,7 +38,7 @@ config = {
         'TargetLanguageCode': 'en',
     },
     'bedrock': {
-        'response_streaming': True,
+        'response_streaming': False,
         'api_request': api_request
     }
 }
@@ -47,6 +48,66 @@ p = pyaudio.PyAudio()
 bedrock_runtime = boto3.client(service_name='bedrock-runtime', region_name=config['region'])
 polly = boto3.client('polly', region_name=config['region'])
 transcribe_streaming = TranscribeStreamingClient(region=config['region'])
+
+FUNCTION_PROMPT = '''
+You will be acting as an sport coach named Joe. Your goal is to give sport advice, please keep your response under 50 characters. Don't use any exclamation point.
+
+You have access to the following tools:
+[
+    {
+        "name": "get_current_weather",
+        "description": "Get the current weather in a given location",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {
+                    "type": "string",
+                    "description": "The city or region which is required to fetch weather information.",
+                },
+                "unit": {
+                    "type": "string",
+                    "enum": [
+                        "celsius",
+                        "fahrenheit"
+                    ]
+                }
+            },
+            "required": ["location"]
+        }
+    },
+    {
+        "name": "get_current_location",
+        "description": "Use this tool to get the current location if user does not provide a location",
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        }
+    }
+]
+Please think step by step. If needed, please select one or more tools whose parameters have already been provided. Respond with only a JSON object matching the following schema inside a <json></json> xml tag:
+{
+    "result": "tool_use",
+    "tool_calls": [
+        {
+            "tool": "<name of the selected tool, leave blank if no tools needed>",
+            "tool_input": <parameters for the selected tool, matching the tool\'s JSON schema>
+        }
+    ]
+    "explanation": "<The explanation why you choosed these tools.>"
+}
+
+If no further tools needed, response with only a JSON object matching the following schema:
+{
+    "result": "stop",
+    "content": "<Your response to the user.>",
+    "explanation": "<The explanation why you get the final answer.>"
+}
+'''
+
+assistant_prefill = {
+    'role': 'assistant',
+    'content': 'Here is the result in JSON: <json>'
+}
 
 
 def printer(text, level):
@@ -89,6 +150,8 @@ class BedrockModelsWrapper:
 
     @staticmethod
     def define_body(text):
+        NORMAL_PROMPT = "You will be acting as an sport coach named Joe. Your goal is to give sport advice, please keep your response under 50 characters. Don't use any exclamation point."
+    
         model_id = config['bedrock']['api_request']['modelId']
         model_provider = model_id.split('.')[0]
         body = config['bedrock']['api_request']['body']
@@ -98,7 +161,22 @@ class BedrockModelsWrapper:
         elif model_provider == 'meta':
             body['prompt'] = text
         elif model_provider == 'anthropic':
-            body['prompt'] = f'\n\nHuman: {text}\n\nAssistant:'
+            if "claude-3" in model_id:
+                #Claude3
+                body['system'] = FUNCTION_PROMPT
+
+                body['messages'] = [
+                    {
+                        "role": "user",
+                        "content": text
+                    }
+                ]
+
+                body['stop_sequences'] = ['</json>']
+
+            else:
+                #Claude2.x
+                body['prompt'] = f'\n\nHuman: You will be acting as an sport coach named Joe. Your goal is to give sport advice. {text} \n\nAssistant:'
         elif model_provider == 'cohere':
             body['prompt'] = text
         else:
@@ -124,8 +202,22 @@ class BedrockModelsWrapper:
             chunk_obj = json.loads(chunk.get('bytes').decode())
             text = chunk_obj['generation']
         elif model_provider == 'anthropic':
-            chunk_obj = json.loads(chunk.get('bytes').decode())
-            text = chunk_obj['completion']
+            #print("model ID is :", model_id)
+            if "claude-3" in model_id:
+                chunk_obj = json.loads(chunk.get('bytes').decode())
+                if chunk_obj['type'] == 'message_delta':
+                    print(f"\nStop reason: {chunk_obj['delta']['stop_reason']}")
+                    print(f"Stop sequence: {chunk_obj['delta']['stop_sequence']}")
+                    print(f"Output tokens: {chunk_obj['usage']['output_tokens']}")
+
+                if chunk_obj['type'] == 'content_block_delta':
+                    if chunk_obj['delta']['type'] == 'text_delta':
+                        print(chunk_obj['delta']['text'], end="")
+                        text = chunk_obj['delta']['text']
+            else:
+                #Claude2.x
+                chunk_obj = json.loads(chunk.get('bytes').decode())
+                text = chunk_obj['completion']
         elif model_provider == 'cohere':
             chunk_obj = json.loads(chunk.get('bytes').decode())
             text = ' '.join([c["text"] for c in chunk_obj['generations']])
@@ -138,14 +230,45 @@ class BedrockModelsWrapper:
 
 def to_audio_generator(bedrock_stream):
     prefix = ''
+    streaming = False
+    if streaming:
+        print("Milestone audio genrator #1")
+        if bedrock_stream:
+            print("Milestone audio genrator #2")
+            for event in bedrock_stream:
+                print("Milestone audio genrator #3")
+                chunk = BedrockModelsWrapper.get_stream_chunk(event)
+                printer('[DEBUG] chunk: {chunk}', 'debug')
+                if chunk:
+                    #print("chunk is :", chunk)
+                    text = BedrockModelsWrapper.get_stream_text(chunk)
+                    print("text is :", text)
+                    if '.' in text or '!' in text:
+                        print("Detect the entire sentence")
+                        a = text.split('.')[:-1]
+                        to_polly = ''.join([prefix, '.'.join(a), '. '])
+                        prefix = text.split('.')[-1]
+                        print(to_polly, flush=True, end='')
+                        #added by Teague
+                        #aws_polly_tts(to_polly)
+                        yield to_polly
+                    else:
+                        prefix = ''.join([prefix, text])
 
-    if bedrock_stream:
-        for event in bedrock_stream:
-            chunk = BedrockModelsWrapper.get_stream_chunk(event)
-            if chunk:
-                text = BedrockModelsWrapper.get_stream_text(chunk)
+            if prefix != '':
+                print(prefix, flush=True, end='')
+                yield f'{prefix}.'
 
-                if '.' in text:
+            print('\n')
+    else:
+        if bedrock_stream:
+            print("bedrock stream is: \n", bedrock_stream)
+            for text in bedrock_stream:
+                #print("chunk is :", chunk)
+                print("Milestone audio genrator #3")
+                #print("text is :", text)
+                if '.' in text or '!' in text:
+                    print("Detect the entire sentence")
                     a = text.split('.')[:-1]
                     to_polly = ''.join([prefix, '.'.join(a), '. '])
                     prefix = text.split('.')[-1]
@@ -154,11 +277,164 @@ def to_audio_generator(bedrock_stream):
                 else:
                     prefix = ''.join([prefix, text])
 
-        if prefix != '':
-            print(prefix, flush=True, end='')
-            yield f'{prefix}.'
+            if prefix != '':
+                print(prefix, flush=True, end='')
+                yield f'{prefix}.'
 
-        print('\n')
+            print('\n')
+
+def get_current_location():
+    # Mock response
+    return 'Guangzhou'
+
+def get_current_weather(location, unit='celsius'):
+    # Mock response
+    print(f'location: {location}')
+    if location == 'Guangzhou':
+        return 'Guangzhou: Sunny at 25 degrees Celsius.'
+    elif location == 'Beijing':
+        return ' Beijing: Rainy at 30 degrees'
+    return 'It\'s a normal sunny day~'
+
+function_map = {
+    'get_current_location': get_current_location,
+    'get_current_weather': get_current_weather
+}
+
+def complete(body):
+
+    model_id = 'anthropic.claude-3-haiku-20240307-v1:0'
+    """
+    body=json.dumps(
+        {
+            'anthropic_version': 'bedrock-2023-05-31',
+            'max_tokens': 1000,
+            'system': FUNCTION_PROMPT,
+            'temperature': 0,
+            'messages': [*messages, assistant_prefill],
+            'stop_sequences': ['</json>']
+        }
+    )
+    """
+    #body_copy = copy.deepcopy(body)
+    body['messages'].append(assistant_prefill)
+
+    print("\nMessages after prefill is \n", body)
+    body = json.dumps(body)
+    response = bedrock_runtime.invoke_model(body=body, modelId=model_id)
+
+    #removing assistant prefill after inferencing
+    #body = copy.deepcopy(body_copy)
+    print("body_copy is \n", body)
+
+    print("Agent is inferencing")
+    response_body = json.loads(response.get('body').read())
+    print(response_body)
+    text = response_body['content'][0]['text']
+    print(text)
+    return parse_json_str(text)
+
+def stream_complete(body):
+    model_id = 'anthropic.claude-3-haiku-20240307-v1:0'
+    """
+    body=json.dumps(
+        {
+            'anthropic_version': 'bedrock-2023-05-31',
+            'max_tokens': 1000,
+            'system': FUNCTION_PROMPT,
+            'temperature': 0,
+            'messages': [*messages, assistant_prefill],
+            'stop_sequences': ['</json>']
+        }
+    )
+    """
+    body['messages'].append(assistant_prefill)
+
+    print("\nMessages after prefill is \n", body)
+    body = json.dumps(body)
+
+    response = bedrock_runtime.invoke_model_with_response_stream(
+        body=body, modelId=model_id
+    )
+
+    '''
+    result_chunks = ''
+    print('LLM Response: \n')
+    for event in response.get("body"):
+        chunk = json.loads(event["chunk"]["bytes"])
+
+        if chunk['type'] == 'content_block_delta' and chunk['delta']['type'] == 'text_delta':
+            text = chunk['delta']['text']
+            print(text, end='')
+            result_chunks += text
+    return parse_json_str(result_chunks)
+    '''
+    return response
+
+
+def agents(body, stream=True):
+    print("\nAgent Milstone #1")
+    body_init = copy.deepcopy(body)
+    finished = False
+    response = ''
+    while not finished:
+        result = {}
+        print("body tracker #1\n", body)
+        result_stream = stream_complete(body)
+        result_chunks = ''
+        print('LLM Response: \n')
+        for event in result_stream.get("body"):
+            chunk = json.loads(event["chunk"]["bytes"])
+
+            if chunk['type'] == 'content_block_delta' and chunk['delta']['type'] == 'text_delta':
+                text = chunk['delta']['text']
+                print(text, end='')
+                result_chunks += text
+        result = parse_json_str(result_chunks)
+
+        body = copy.deepcopy(body_init)
+        print("body tracker #2\n", body)
+
+        print("\nAgent Milstone #2")
+
+        if result['result'] == 'tool_use':
+            assistant_msg = ''
+            function_msg = ''
+            for t in result['tool_calls']:
+                tool = t['tool']
+                tool_input = t['tool_input']
+                assistant_msg += f'Should use {tool} tool with args: {json.dumps(tool_input)}\n'
+                function2call = function_map[tool]
+                # calling the function
+                function_result = function2call(**tool_input)
+                # Append to prompts
+                function_msg += f'I have used the {tool} tool with args: {json.dumps(tool_input)} and the result is : {function_result}\n'
+            
+            body = body_init
+            print(type(body))
+            print(body['messages'])
+            #body=json.load(body)
+            print(type(body))
+            body['messages'].append({'role': 'assistant', 'content': assistant_msg})
+            body['messages'].append({'role': 'user', 'content': function_msg})
+            print(body)
+        elif result['result'] == 'stop':
+            finished = True
+            response = result['content']
+            
+    return response, result_stream
+
+def parse_json_str(json_str):
+    # response from LLM may contains \n
+    result = {}
+    try:
+        result = json.loads(json_str.replace('\n', '').replace('\r', ''))
+        print('LLM response can be parsed as a valid JSON object.')
+    except Exception as e:
+        print('Cannot parsed to a valid python dict object')
+        print(e)
+    return result
+
 
 
 class BedrockWrapper:
@@ -177,18 +453,51 @@ class BedrockWrapper:
         printer(f"[DEBUG] Request body: {body}", 'debug')
 
         try:
-            body_json = json.dumps(body)
+            #body_json = json.dumps(body)
+            #print('body_json: \n', body_json)
+            """
             response = bedrock_runtime.invoke_model_with_response_stream(
                 body=body_json,
                 modelId=config['bedrock']['api_request']['modelId'],
                 accept=config['bedrock']['api_request']['accept'],
                 contentType=config['bedrock']['api_request']['contentType']
             )
+            print("Using the original response")
+            """
+            print('\nbody: \n', body)
+            #body = json.dumps(body)
+            response, bedrock_stream = agents(body)
+            print("Using the function calling")
+
+            #print("Response is \n",response)
+            
+            
 
             printer('[DEBUG] Capturing Bedrocks response/bedrock_stream', 'debug')
-            bedrock_stream = response.get('body')
+            #bedrock_stream = result_stream.get('body')
+            #bedrock_stream = response
+            print("bedrock_stream milestone#1")
+            print("response is \n", response)
+            print("bedrock_stream is \n", bedrock_stream)
 
-            audio_gen = to_audio_generator(bedrock_stream)
+            #for debuging
+            '''
+            result_chunks = ''
+            print('LLM Response: \n')
+            for event in bedrock_stream.get("body"):
+                print("event:\n", event)
+                chunk = json.loads(event["chunk"]["bytes"])
+                print("chunk is \n", chunk)
+                if chunk['type'] == 'content_block_delta' and chunk['delta']['type'] == 'text_delta':
+                    text = chunk['delta']['text']
+                    print(text, end='')
+                    result_chunks += text
+            print ("result_chunks is \n",result_chunks)
+            '''
+
+            #audio_gen = to_audio_generator(bedrock_stream)
+            #Try using the entire response string instead of streaming response
+            audio_gen = to_audio_generator(response)
             printer('[DEBUG] Created bedrock stream to audio generator', 'debug')
 
             reader = Reader()
@@ -341,8 +650,8 @@ class EventHandler(TranscriptResultStreamHandler):
                     if len(EventHandler.text) == 0:
                         last_speech = config['last_speech']
                         print(last_speech, flush=True)
-                        aws_polly_tts(last_speech)
-                        os._exit(0)  # exit from a child process
+                        #aws_polly_tts(last_speech)
+                        #os._exit(0)  # exit from a child process
                     else:
                         input_text = ' '.join(EventHandler.text)
                         printer(f'\n[INFO] User input: {input_text}', 'info')

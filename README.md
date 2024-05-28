@@ -12,6 +12,11 @@ Key aspects shown in the code:
 
 In summary, this code serves as an example implementation for developers to reference when building voice-enabled applications powered by Foundational AI through Amazon Bedrock and related AWS services.
 
+## Quick Demo
+<video width="640" height="360" controls>
+  <source src="./docs/demo.mov" type="video/quicktime">
+</video>
+
 ## Architecture reference
 
 To provide the best possible user experience for voice conversations, this solution utilizes streaming wherever supported by the underlying services. Specifically, streaming is used at every step except for the HTTP request to Amazon Bedrock. The Amazon Bedrock response is also streamed back to the user.

@@ -101,6 +101,17 @@ api_request_list = {
             "temperature": 0.8,
         }
     },
+    'anthropic.claude-3-haiku-20240307-v1:0': {
+        "modelId": "anthropic.claude-3-haiku-20240307-v1:0",
+        "contentType": "application/json",
+        "accept": "application/json",
+        "body": {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1024,
+            "temperature": 0.9,
+            "messages": "",
+        }
+    },
 }
 
 
