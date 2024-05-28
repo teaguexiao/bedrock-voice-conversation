@@ -14,7 +14,7 @@ In summary, this code serves as an example implementation for developers to refe
 
 ## Quick Demo
 <video width="640" height="360" controls>
-  <source src="./docs/demo.mov" type="video/quicktime">
+  <source src="./docs/demo.mp4" type="video/mp4">
 </video>
 
 ## Architecture reference
